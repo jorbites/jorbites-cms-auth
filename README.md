@@ -82,3 +82,19 @@ backend:
 ```
 
 That's it! When you visit `https://jorbites.github.io/content/admin/` and click **Login with GitHub**, Sveltia CMS will authenticate through your Cloudflare Worker cleanly.
+
+---
+
+## 🔒 Security Controls
+
+- **Exact Origin Enforcement**: `postMessage` handshake and token delivery strictly require `e.origin === ALLOWED_ORIGIN` (no wildcard `*` or `*.github.io` matching). Invalid or wildcard `ALLOWED_ORIGIN` values safely fall back to `https://jorbites.github.io`.
+- **OAuth Scope Allowlist**: The `/auth` endpoint filters the `scope` parameter against an explicit allowlist (`public_repo`, `repo`, `read:user`, `user:email`), defaulting to `public_repo`.
+- **CSRF State Protection**: `/auth` issues a `HttpOnly; Secure; SameSite=Lax` cookie (`oauth_state`) verified in constant time on `/callback` and cleared (`Max-Age=0`) immediately upon handling.
+- **Safe Script Serialization**: Callback responses escape `<`, `>`, `&`, and line separators before embedding JSON into inline `<script>`, and return `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+### Running Tests
+
+```bash
+npm run typecheck
+npm test
+```
