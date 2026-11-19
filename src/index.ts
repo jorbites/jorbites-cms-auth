@@ -10,21 +10,73 @@ export interface Env {
 }
 
 const DEFAULT_ALLOWED_ORIGIN = 'https://jorbites.github.io';
+const ALLOWED_SCOPES = new Set(['public_repo', 'repo', 'read:user', 'user:email']);
+
+export function sanitizeScope(rawScope: string | null): string {
+    if (!rawScope) {
+        return 'public_repo';
+    }
+    const validScopes = rawScope
+        .split(/[\s,]+/)
+        .map((s) => s.trim())
+        .filter((s) => ALLOWED_SCOPES.has(s));
+    return validScopes.length > 0 ? Array.from(new Set(validScopes)).join(' ') : 'public_repo';
+}
+
+function serializeForScript(value: unknown): string {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+    const encoder = new TextEncoder();
+    const aBytes = encoder.encode(a);
+    const bBytes = encoder.encode(b);
+    if (aBytes.length !== bBytes.length) {
+        return false;
+    }
+    let diff = 0;
+    for (let i = 0; i < aBytes.length; i++) {
+        diff |= aBytes[i] ^ bBytes[i];
+    }
+    return diff === 0;
+}
+
+function resolveAllowedOrigin(configured?: string): string {
+    const candidate = (configured || DEFAULT_ALLOWED_ORIGIN).trim();
+    try {
+        const parsed = new URL(candidate);
+        if (parsed.protocol !== 'https:' && parsed.hostname !== 'localhost') {
+            return DEFAULT_ALLOWED_ORIGIN;
+        }
+        return parsed.origin;
+    } catch {
+        return DEFAULT_ALLOWED_ORIGIN;
+    }
+}
 
 function createCorsHeaders(allowedOrigin: string): HeadersInit {
     return {
         'Access-Control-Allow-Origin': allowedOrigin,
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        Vary: 'Origin',
     };
 }
 
 function renderHtmlResponse(
     status: 'success' | 'error',
     payload: Record<string, unknown>,
-    allowedOrigin: string
+    allowedOrigin: string,
+    extraHeaders?: Record<string, string>
 ): Response {
-    const serializedPayload = JSON.stringify(payload);
+    const serializedAllowedOrigin = serializeForScript(allowedOrigin);
+    const serializedStatus = serializeForScript(status);
+    const serializedPayloadJson = serializeForScript(JSON.stringify(payload));
     const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -58,21 +110,26 @@ function renderHtmlResponse(
   </div>
   <script>
     (function() {
-      const allowedOrigin = ${JSON.stringify(allowedOrigin)};
+      const allowedOrigin = ${serializedAllowedOrigin};
+      const status = ${serializedStatus};
+      const payloadJson = ${serializedPayloadJson};
       function receiveMessage(e) {
-        // Only accept messages from the allowed origin or same host
-        if (allowedOrigin !== '*' && e.origin !== allowedOrigin && !e.origin.endsWith('.github.io')) {
+        if (e.origin !== allowedOrigin) {
           console.warn('Rejected postMessage from untrusted origin:', e.origin);
           return;
         }
-        window.opener.postMessage(
-          'authorization:github:${status}:${serializedPayload.replace(/'/g, "\\'")}',
-          e.origin
-        );
+        if (window.opener) {
+          window.opener.postMessage(
+            'authorization:github:' + status + ':' + payloadJson,
+            allowedOrigin
+          );
+        }
         window.close();
       }
       window.addEventListener('message', receiveMessage, false);
-      window.opener.postMessage('authorizing:github', '*');
+      if (window.opener) {
+        window.opener.postMessage('authorizing:github', allowedOrigin);
+      }
     })();
   </script>
 </body>
@@ -81,7 +138,10 @@ function renderHtmlResponse(
     return new Response(html, {
         headers: {
             'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
             ...createCorsHeaders(allowedOrigin),
+            ...(extraHeaders || {}),
         },
     });
 }
@@ -89,7 +149,7 @@ function renderHtmlResponse(
 export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         const url = new URL(request.url);
-        const allowedOrigin = env.ALLOWED_ORIGIN || DEFAULT_ALLOWED_ORIGIN;
+        const allowedOrigin = resolveAllowedOrigin(env.ALLOWED_ORIGIN);
 
         // Handle CORS preflight
         if (request.method === 'OPTIONS') {
@@ -118,7 +178,7 @@ export default {
                 return new Response('Missing GITHUB_CLIENT_ID', { status: 500 });
             }
 
-            const scope = url.searchParams.get('scope') || 'public_repo';
+            const scope = sanitizeScope(url.searchParams.get('scope'));
             // Generate secure random state token
             const state = crypto.randomUUID();
 
@@ -158,27 +218,43 @@ export default {
             );
             const expectedState = cookies['oauth_state'];
 
+            const clearStateCookie = {
+                'Set-Cookie':
+                    'oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/callback; Max-Age=0',
+            };
+
             if (!code) {
                 return renderHtmlResponse(
                     'error',
                     { error: 'Missing authorization code from GitHub' },
-                    allowedOrigin
+                    allowedOrigin,
+                    clearStateCookie
                 );
             }
 
-            if (!state || !expectedState || state !== expectedState) {
+            if (
+                !state ||
+                !expectedState ||
+                !timingSafeEqualString(state, expectedState)
+            ) {
                 return renderHtmlResponse(
                     'error',
-                    { error: 'Invalid or expired CSRF state token. Please try logging in again.' },
-                    allowedOrigin
+                    {
+                        error: 'Invalid or expired CSRF state token. Please try logging in again.',
+                    },
+                    allowedOrigin,
+                    clearStateCookie
                 );
             }
 
             if (!env.GITHUB_CLIENT_SECRET) {
                 return renderHtmlResponse(
                     'error',
-                    { error: 'Server configuration error: Missing GITHUB_CLIENT_SECRET' },
-                    allowedOrigin
+                    {
+                        error: 'Server configuration error: Missing GITHUB_CLIENT_SECRET',
+                    },
+                    allowedOrigin,
+                    clearStateCookie
                 );
             }
 
@@ -210,18 +286,29 @@ export default {
                 if (data.error || !data.access_token) {
                     const errorMessage =
                         data.error_description || data.error || 'Failed to exchange token with GitHub';
-                    return renderHtmlResponse('error', { error: errorMessage }, allowedOrigin);
+                    return renderHtmlResponse(
+                        'error',
+                        { error: errorMessage },
+                        allowedOrigin,
+                        clearStateCookie
+                    );
                 }
 
                 // Successful authentication
                 return renderHtmlResponse(
                     'success',
                     { token: data.access_token, provider: 'github' },
-                    allowedOrigin
+                    allowedOrigin,
+                    clearStateCookie
                 );
             } catch (err: unknown) {
                 const message = err instanceof Error ? err.message : 'Unknown error during token exchange';
-                return renderHtmlResponse('error', { error: message }, allowedOrigin);
+                return renderHtmlResponse(
+                    'error',
+                    { error: message },
+                    allowedOrigin,
+                    clearStateCookie
+                );
             }
         }
 
